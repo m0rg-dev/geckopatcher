@@ -122,7 +122,10 @@ where
             }
             FstNodeType::File => {
                 parent_dir.add_file(File::new(
-                    FileDataSource::Reader(reader.clone()),
+                    FileDataSource::Reader {
+                        source: reader.clone(),
+                        initial_offset: entry.file_offset_parent_dir.try_into().unwrap(),
+                    },
                     entry.relative_file_name.clone(),
                     entry.file_offset_parent_dir,
                     entry.file_size_next_dir_index,
@@ -231,29 +234,29 @@ where
                 num_entries * FstEntry::BLOCK_SIZE
             );
 
-            system.add_file(File::new(
-                FileDataSource::Reader(reader.clone()),
+            system.add_file(File::from_reader_at_position(
+                reader.clone(),
                 "iso.hdr",
                 0,
                 consts::HEADER_LENGTH,
                 0,
             ));
-            system.add_file(File::new(
-                FileDataSource::Reader(reader.clone()),
+            system.add_file(File::from_reader_at_position(
+                reader.clone(),
                 "AppLoader.ldr",
                 consts::HEADER_LENGTH,
                 dol_offset - consts::HEADER_LENGTH,
                 0,
             ));
-            system.add_file(File::new(
-                FileDataSource::Reader(reader.clone()),
+            system.add_file(File::from_reader_at_position(
+                reader.clone(),
                 "Start.dol",
                 dol_offset,
                 fst_offset as usize - dol_offset,
                 0,
             ));
-            system.add_file(File::new(
-                FileDataSource::Reader(reader.clone()),
+            system.add_file(File::from_reader_at_position(
+                reader.clone(),
                 "Game.toc",
                 fst_offset as usize,
                 fst_size,
@@ -338,7 +341,7 @@ where
                 *offset += file.len() as u64;
                 *offset = align_addr(*offset, 2);
 
-                file.new_offset = pos;
+                file.fst = fst_entry.clone();
                 output_fst.push(fst_entry);
                 files.push(file.clone());
             }
@@ -467,7 +470,7 @@ where
                     human_bytes(file.len() as f64)
                 ))?;
             }
-            let padding_size = file.new_offset as usize - offset;
+            let padding_size = file.fst.file_offset_parent_dir - offset;
             writer.write_all(&vec![0u8; padding_size]).await?;
             // Copy the file from the FileSystem to the Writer.
             // async_std::io::copy(file, writer).await?; // way too slow
@@ -581,14 +584,23 @@ struct FileState {
 
 #[derive(Debug)]
 pub enum FileDataSource<R> {
-    Reader(Arc<Mutex<DiscReader<R>>>),
+    Reader {
+        initial_offset: u64,
+        source: Arc<Mutex<DiscReader<R>>>,
+    },
     Box(Arc<Mutex<Box<[u8]>>>),
 }
 
 impl<R> Clone for FileDataSource<R> {
     fn clone(&self) -> Self {
         match self {
-            Self::Reader(arg0) => Self::Reader(arg0.clone()),
+            Self::Reader {
+                initial_offset,
+                source,
+            } => Self::Reader {
+                initial_offset: *initial_offset,
+                source: source.clone(),
+            },
             Self::Box(arg0) => Self::Box(arg0.clone()),
         }
     }
@@ -597,7 +609,6 @@ impl<R> Clone for FileDataSource<R> {
 #[derive(Debug)]
 pub struct File<R> {
     fst: FstEntry,
-    new_offset: u64,
     state: FileState,
     data: FileDataSource<R>,
 }
@@ -606,7 +617,6 @@ impl<R> Clone for File<R> {
     fn clone(&self) -> Self {
         Self {
             fst: self.fst.clone(),
-            new_offset: self.new_offset,
             state: self.state,
             data: self.data.clone(),
         }
@@ -629,9 +639,33 @@ impl<R> File<R> {
                 file_size_next_dir_index,
                 file_name_offset,
             },
-            new_offset: 0,
             state: Default::default(),
             data,
+        }
+    }
+
+    /// Creates a new File that reads itself from `source` at `offset` (i.e.
+    /// identity mapping)
+    pub fn from_reader_at_position<S: ToString>(
+        source: Arc<Mutex<DiscReader<R>>>,
+        name: S,
+        offset: usize,
+        length: usize,
+        file_name_offset: usize,
+    ) -> Self {
+        Self {
+            fst: FstEntry {
+                kind: FstNodeType::File,
+                relative_file_name: name.to_string(),
+                file_offset_parent_dir: offset,
+                file_size_next_dir_index: length,
+                file_name_offset,
+            },
+            state: FileState::default(),
+            data: FileDataSource::Reader {
+                initial_offset: offset.try_into().unwrap(),
+                source,
+            },
         }
     }
 
@@ -692,24 +726,22 @@ impl<R: AsyncSeek> AsyncSeek for File<R> {
             }
         };
         match &self.data {
-            FileDataSource::Reader(reader) => match reader.try_lock_arc() {
+            FileDataSource::Reader {
+                source: reader,
+                initial_offset,
+            } => match reader.try_lock_arc() {
                 Some(mut guard) => {
                     let guard_mut = guard.deref_mut();
                     let guard_pin = std::pin::pin!(guard_mut);
                     match guard_pin.poll_seek(
                         cx,
                         match pos {
-                            SeekFrom::Start(pos) => {
-                                SeekFrom::Start(self.fst.file_offset_parent_dir as u64 + pos)
-                            }
+                            SeekFrom::Start(pos) => SeekFrom::Start(initial_offset + pos),
                             SeekFrom::End(pos) => SeekFrom::Start(
-                                ((self.fst.file_offset_parent_dir as i64 + self.len() as i64) + pos)
-                                    as u64,
+                                ((*initial_offset as i64 + self.len() as i64) + pos) as u64,
                             ),
                             SeekFrom::Current(pos) => SeekFrom::Start(
-                                (self.fst.file_offset_parent_dir as i64
-                                    + self.state.cursor as i64
-                                    + pos) as u64,
+                                (*initial_offset as i64 + self.state.cursor as i64 + pos) as u64,
                             ),
                         },
                     ) {
@@ -771,15 +803,15 @@ impl<R: AsyncRead + AsyncSeek> AsyncRead for File<R> {
         );
         match self.state.state {
             FileReadState::Seeking => match &self.data {
-                FileDataSource::Reader(reader) => match reader.try_lock_arc() {
+                FileDataSource::Reader {
+                    source: reader,
+                    initial_offset,
+                } => match reader.try_lock_arc() {
                     Some(mut guard) => {
                         let guard_pin = std::pin::pin!(guard.deref_mut());
-                        match guard_pin.poll_seek(
-                            cx,
-                            SeekFrom::Start(
-                                self.fst.file_offset_parent_dir as u64 + self.state.cursor,
-                            ),
-                        ) {
+                        match guard_pin
+                            .poll_seek(cx, SeekFrom::Start(initial_offset + self.state.cursor))
+                        {
                             Poll::Ready(Ok(_)) => {
                                 self.state.state = FileReadState::Reading;
                                 cx.waker().wake_by_ref();
@@ -808,7 +840,7 @@ impl<R: AsyncRead + AsyncSeek> AsyncRead for File<R> {
                 }
             },
             FileReadState::Reading => match &self.data {
-                FileDataSource::Reader(reader) => match reader.try_lock_arc() {
+                FileDataSource::Reader { source: reader, .. } => match reader.try_lock_arc() {
                     Some(mut guard) => {
                         let guard_pin = std::pin::pin!(guard.deref_mut());
                         match guard_pin.poll_read(cx, &mut buf[..end]) {
