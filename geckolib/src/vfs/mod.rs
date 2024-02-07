@@ -475,13 +475,12 @@ where
 
         let mut offset = (fst_list_offset + fst_len) as u64;
         for node in self.root_mut().iter_mut() {
-            let l = 0;
             GeckoFS::visitor_fst_entries(
                 node.as_mut(),
                 &mut output_fst,
                 &mut files,
                 &mut fst_name_bank,
-                l,
+                0,
                 &mut offset,
             );
         }
@@ -931,6 +930,10 @@ impl<R> File<R> {
 
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    pub fn offset(&self) -> usize {
+        self.fst.file_offset_parent_dir
     }
 }
 
