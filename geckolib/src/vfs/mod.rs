@@ -12,6 +12,7 @@ use byteorder::{ByteOrder, BE};
 use eyre::Result;
 #[cfg(feature = "progress")]
 use human_bytes::human_bytes;
+use std::collections::BTreeSet;
 use std::io::{Error, SeekFrom};
 use std::ops::DerefMut;
 #[cfg(feature = "progress")]
@@ -287,15 +288,14 @@ where
     }
 
     fn visitor_fst_entries(
-        node: &mut dyn Node<R>,
+        node: &dyn Node<R>,
         output_fst: &mut Vec<FstEntry>,
-        files: &mut Vec<File<R>>,
+        files: &mut BTreeSet<File<R>>,
         fst_name_bank: &mut Vec<u8>,
         cur_parent_dir_index: usize,
-        offset: &mut u64,
     ) {
-        match node.as_enum_mut() {
-            NodeEnumMut::Directory(dir) => {
+        match node.as_enum_ref() {
+            NodeEnumRef::Directory(dir) => {
                 let fst_entry = FstEntry {
                     kind: FstNodeType::Directory,
                     file_name_offset: fst_name_bank.len(),
@@ -310,40 +310,35 @@ where
 
                 output_fst.push(fst_entry);
 
-                for child in &mut dir.children {
+                for child in &dir.children {
                     GeckoFS::visitor_fst_entries(
-                        child.as_mut(),
+                        child.as_ref(),
                         output_fst,
                         files,
                         fst_name_bank,
                         this_dir_index,
-                        offset,
                     );
                 }
 
                 output_fst[this_dir_index].file_size_next_dir_index = output_fst.len();
             }
-            NodeEnumMut::File(file) => {
-                let pos = align_addr(*offset, 5);
-                *offset = pos;
-
+            NodeEnumRef::File(file) => {
                 let fst_entry = FstEntry {
                     kind: FstNodeType::File,
                     file_size_next_dir_index: file.len(),
                     file_name_offset: fst_name_bank.len(),
-                    file_offset_parent_dir: pos as usize,
+                    file_offset_parent_dir: file.fst.file_offset_parent_dir,
                     relative_file_name: file.name().to_string(),
                 };
+
+                // TODO temp until I sort out filename repacking
+                assert_eq!(fst_name_bank.len(), file.fst.file_name_offset);
 
                 fst_name_bank.extend_from_slice(file.name().as_bytes());
                 fst_name_bank.push(0);
 
-                *offset += file.len() as u64;
-                *offset = align_addr(*offset, 2);
-
-                file.fst = fst_entry.clone();
                 output_fst.push(fst_entry);
-                files.push(file.clone());
+                files.insert(file.clone());
             }
         };
     }
@@ -408,9 +403,8 @@ where
             ..Default::default()
         }];
         let mut fst_name_bank = Vec::new();
-        let mut files = Vec::new();
+        let mut files = BTreeSet::new();
 
-        let mut offset = (fst_list_offset + fst_len as usize) as u64;
         for node in self.root_mut().children_mut() {
             GeckoFS::visitor_fst_entries(
                 node.as_mut(),
@@ -418,7 +412,6 @@ where
                 &mut files,
                 &mut fst_name_bank,
                 0,
-                &mut offset,
             );
         }
         output_fst[0].file_size_next_dir_index = output_fst.len();
@@ -461,6 +454,7 @@ where
         let mut offset = writer.seek(SeekFrom::Current(0)).await? as usize;
         #[cfg(feature = "progress")]
         let mut inc_buffer = 0usize;
+
         for mut file in files {
             #[cfg(feature = "progress")]
             if let Ok(mut updater) = UPDATER.try_lock() {
@@ -620,6 +614,32 @@ impl<R> Clone for File<R> {
             state: self.state,
             data: self.data.clone(),
         }
+    }
+}
+
+impl<R> PartialEq for File<R> {
+    fn eq(&self, other: &Self) -> bool {
+        // TODO should we compare names as well? In theory this only matters for
+        // write order planning but that's not obvious to potential users
+        self.fst.file_offset_parent_dir == other.fst.file_offset_parent_dir
+            && self.fst.file_size_next_dir_index == other.fst.file_size_next_dir_index
+    }
+}
+
+// files sortable by output position
+impl<R> PartialOrd for File<R> {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl<R> Eq for File<R> {}
+
+impl<R> Ord for File<R> {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.fst
+            .file_offset_parent_dir
+            .cmp(&other.fst.file_offset_parent_dir)
     }
 }
 
