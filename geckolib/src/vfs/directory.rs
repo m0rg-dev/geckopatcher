@@ -1,3 +1,5 @@
+use std::collections::VecDeque;
+
 use super::{File, Node, NodeEnumMut, NodeEnumRef, NodeType};
 use eyre::Result;
 
@@ -97,11 +99,19 @@ where
         }
     }
 
-    pub fn iter(&self) -> std::slice::Iter<'_, Box<dyn Node<R>>> {
+    pub fn iter(&self) -> DirectoryIter<'_, R> {
+        DirectoryIter {
+            top: Some(self),
+            children: self.children.as_slice(),
+            parent: None,
+        }
+    }
+
+    pub fn children(&self) -> std::slice::Iter<'_, Box<dyn Node<R>>> {
         self.children.iter()
     }
 
-    pub fn iter_mut(&mut self) -> std::slice::IterMut<'_, Box<dyn Node<R>>> {
+    pub fn children_mut(&mut self) -> std::slice::IterMut<'_, Box<dyn Node<R>>> {
         self.children.iter_mut()
     }
 
@@ -216,5 +226,56 @@ impl<R> Node<R> for Directory<R> {
 
     fn as_file_mut(&mut self) -> Option<&mut File<R>> {
         None
+    }
+}
+
+// ripped off from https://aloso.github.io/2021/03/09/creating-an-iterator
+pub struct DirectoryIter<'dir, R> {
+    top: Option<&'dir Directory<R>>,
+    children: &'dir [Box<dyn Node<R>>],
+    parent: Option<Box<DirectoryIter<'dir, R>>>,
+}
+
+impl<'dir, R> Iterator for DirectoryIter<'dir, R> {
+    type Item = &'dir dyn Node<R>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if let Some(top) = self.top.take() {
+            return Some(top);
+        }
+
+        match self.children.first() {
+            None => {
+                let parent = self.parent.take()?;
+                *self = *parent;
+                self.next()
+            }
+            Some(node) => {
+                self.children = &self.children[1..];
+
+                match node.as_enum_ref() {
+                    NodeEnumRef::File(file) => Some(file),
+                    NodeEnumRef::Directory(dir) => {
+                        *self = DirectoryIter {
+                            top: Some(dir),
+                            children: dir.children.as_slice(),
+                            parent: Some(Box::new(std::mem::take(self))),
+                        };
+
+                        self.next()
+                    }
+                }
+            }
+        }
+    }
+}
+
+impl<R> Default for DirectoryIter<'_, R> {
+    fn default() -> Self {
+        Self {
+            top: None,
+            children: &[],
+            parent: None,
+        }
     }
 }

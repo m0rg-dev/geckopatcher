@@ -335,21 +335,17 @@ where
         Ok(Self { root, system })
     }
 
-    /// Visits the directory tree to calculate the length of the FST table
-    fn visitor_fst_len(mut acc: usize, node: &dyn Node<R>) -> usize {
-        match node.as_enum_ref() {
-            NodeEnumRef::Directory(dir) => {
-                acc += 12 + dir.name().len() + 1;
-
-                for child in &dir.children {
-                    acc = GeckoFS::visitor_fst_len(acc, child.as_ref());
-                }
-            }
-            NodeEnumRef::File(file) => {
-                acc += 12 + file.name().len() + 1;
-            }
-        };
-        acc
+    /// Calculates the length of the FST.
+    fn fst_len(&self) -> u32 {
+        self.root
+            .iter()
+            .map(|node| {
+                u32::try_from(12 + node.name().len() + 1)
+                    .expect("FST entry size exceeds 32-bit limit")
+            })
+            .reduce(|acc, e| acc.checked_add(e).expect("FST size exceeds 32-bit limit"))
+            .unwrap_or(1)
+            - 1
     }
 
     fn visitor_fst_entries(
@@ -432,13 +428,13 @@ where
         let fst_list_offset = align_addr(fst_list_offset_raw, consts::FST_ALIGNMENT_BIT);
         let fst_list_padding_size = fst_list_offset - fst_list_offset_raw;
 
-        let fst_len = GeckoFS::visitor_fst_len(0, &self.root) - 1;
+        let fst_len = self.fst_len();
 
         let d = [
             (dol_offset >> if is_wii { 2u8 } else { 0u8 }) as u32,
             (fst_list_offset >> if is_wii { 2u8 } else { 0u8 }) as u32,
-            fst_len as u32,
-            fst_len as u32,
+            fst_len,
+            fst_len,
         ];
         let mut b = vec![0u8; 0x10];
         BE::write_u32_into(&d, &mut b);
@@ -476,8 +472,8 @@ where
         let mut fst_name_bank = Vec::new();
         let mut files = Vec::new();
 
-        let mut offset = (fst_list_offset + fst_len) as u64;
-        for node in self.root_mut().iter_mut() {
+        let mut offset = (fst_list_offset + fst_len as usize) as u64;
+        for node in self.root_mut().children_mut() {
             GeckoFS::visitor_fst_entries(
                 node.as_mut(),
                 &mut output_fst,

@@ -20,7 +20,7 @@ struct Args {
 
 fn dump_tree<R: 'static>(dir: &Directory<R>, depth: usize) {
     println!("{}{}", "  ".repeat(depth), dir.name());
-    for entry in dir.iter() {
+    for entry in dir.children() {
         if let Some(subdir) = entry.as_directory_ref() {
             dump_tree(subdir, depth + 1);
         }
