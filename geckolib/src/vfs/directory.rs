@@ -1,5 +1,3 @@
-use std::collections::VecDeque;
-
 use super::{File, Node, NodeEnumMut, NodeEnumRef, NodeType};
 use eyre::Result;
 
